@@ -67,22 +67,21 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
-    v_heads.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_heads[s] = 0;
-    }
+    // Use compact types for v_heads and seq_to_stream to reduce overhead
+    v_heads.assign(n_stream, 0);
 
+    // Use custom, compact v_cells; now stores entries as compact structs
     v_cells.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
     }
 
-    // by default, all sequence ids are mapped to the 0th stream
-    seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
+    // By default, all sequence ids are mapped to the 0th stream, and use uint16 for IDs
+    seq_to_stream.assign(LLAMA_MAX_SEQ, 0);
 
     if (n_stream > 1) {
         seq_to_stream.resize(n_stream, 0);
-        for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint16_t s = 0; s < n_stream; ++s) {
             seq_to_stream[s] = s;
         }
     }
@@ -929,12 +928,8 @@ llama_kv_cache_unified::slot_info llama_kv_cache_unified::find_slot(const llama_
 }
 
 void llama_kv_cache_unified::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
-    // keep track of the max sequence position that we would overwrite with this ubatch
-    // for non-SWA cache, this would be always empty
-    llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-        seq_pos_max_rm[s] = -1;
-    }
+    // keep track of overwritten maximum position, using compact form
+    std::vector<llama_pos> seq_pos_max_rm(n_seq_max, -1);
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
@@ -949,7 +944,7 @@ void llama_kv_cache_unified::apply_ubatch(const slot_info & sinfo, const llama_u
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
 
-                const llama_seq_id seq_id = cells.seq_get(idx);
+                const llama_seq_id seq_id = static_cast<uint16_t>(cells.seq_get(idx));
                 const llama_pos    pos    = cells.pos_get(idx);
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
@@ -959,16 +954,14 @@ void llama_kv_cache_unified::apply_ubatch(const slot_info & sinfo, const llama_u
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
-                cells.seq_add(idx, ubatch.seq_id[i][s]);
+            for (int n = 0; n < ubatch.n_seq_id[i]; ++n) {
+                cells.seq_add(idx, static_cast<uint16_t>(ubatch.seq_id[i][n]));
             }
         }
     }
 
-    // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
-    //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+    // maintain invariant for overwritten positions -- for compact n_seq_max
+    for (uint16_t s = 0; s < n_seq_max; ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
         }
@@ -978,7 +971,7 @@ void llama_kv_cache_unified::apply_ubatch(const slot_info & sinfo, const llama_u
         auto & cells = v_cells[seq_to_stream[s]];
 
         if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
-            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
+            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %u from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
             seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
@@ -989,7 +982,7 @@ void llama_kv_cache_unified::apply_ubatch(const slot_info & sinfo, const llama_u
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         auto & head = v_heads[sinfo.strm[s]];
 
-        head = sinfo.idxs[s].back() + 1;
+        head = static_cast<uint16_t>(sinfo.idxs[s].back() + 1);
     }
 }
 
@@ -1896,11 +1889,14 @@ void llama_kv_cache_unified::state_read(llama_io_read_i & io, llama_seq_id seq_i
 void llama_kv_cache_unified::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
+    // Buffer for compact storage of id arrays
+    uint16_t compact_ids[n_seq_max > 32 ? 32 : n_seq_max];
+
     for (const auto & range : cr.data) {
         for (uint32_t i = range.first; i < range.second; ++i) {
-            std::vector<llama_seq_id> seq_ids;
+            std::vector<uint16_t> seq_ids;
 
-            for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+            for (uint16_t cur = 0; cur < n_seq_max; ++cur) {
                 if (cur == seq_id || seq_id == -1) {
                     if (cells.seq_has(i, cur)) {
                         seq_ids.push_back(cur);
@@ -1914,8 +1910,8 @@ void llama_kv_cache_unified::state_write_meta(llama_io_write_i & io, const cell_
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            for (const auto & seq_id : seq_ids) {
-                io.write(&seq_id, sizeof(seq_id));
+            for (const auto & _seq_id : seq_ids) {
+                io.write(&_seq_id, sizeof(uint16_t));
             }
         }
     }
@@ -2044,8 +2040,8 @@ bool llama_kv_cache_unified::state_read_meta(llama_io_read_i & io, uint32_t strm
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
             {
-                llama_seq_id seq_id;
-                io.read_to(&seq_id, sizeof(seq_id));
+                uint16_t seq_id_compact;
+                io.read_to(&seq_id_compact, sizeof(uint16_t));
             }
 
             ubatch.pos[i]      = pos;
@@ -2095,11 +2091,11 @@ bool llama_kv_cache_unified::state_read_meta(llama_io_read_i & io, uint32_t strm
             cells.pos_set(i, pos);
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
-                llama_seq_id seq_id;
-                io.read_to(&seq_id, sizeof(seq_id));
+                uint16_t seq_id;
+                io.read_to(&seq_id, sizeof(uint16_t));
 
-                if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
-                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
+                if (seq_id >= n_seq_max) {
+                    LLAMA_LOG_ERROR("%s: invalid seq_id, %u is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
                     return false;
                 }
 

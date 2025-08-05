@@ -134,6 +134,113 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     return 0;
 }
 
+// Structure to hold device capabilities information
+struct device_capabilities {
+    ggml_backend_dev_t device;
+    size_t free_memory;
+    size_t total_memory;
+    float compute_score;  // Relative compute performance score
+    float bandwidth_score; // Memory bandwidth score
+    std::string name;
+    std::string description;
+};
+
+// Calculate a compute capability score for a device based on its characteristics
+static float calculate_compute_score(ggml_backend_dev_t dev) {
+    // Base score by device type
+    float base_score = 0.0f;
+    
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            base_score = 100.0f;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            base_score = 50.0f;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            base_score = 10.0f;
+            break;
+        default:
+            base_score = 5.0f;
+    }
+    
+    // Get device name and look for indicators of capability in the description
+    std::string desc = ggml_backend_dev_description(dev);
+    std::string name = ggml_backend_dev_name(dev);
+    
+    // Adjust score based on device description (higher tier GPUs get higher scores)
+    if (desc.find("RTX 40") != std::string::npos) base_score *= 1.5f;
+    else if (desc.find("RTX 30") != std::string::npos) base_score *= 1.3f;
+    else if (desc.find("RTX 20") != std::string::npos) base_score *= 1.1f;
+    else if (desc.find("A100") != std::string::npos) base_score *= 1.8f;
+    else if (desc.find("H100") != std::string::npos) base_score *= 2.0f;
+    
+    // RPC devices get a slight boost as they might be specialized
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+        base_score *= 1.1f;
+    }
+    
+    return base_score;
+}
+
+// Calculate bandwidth score - approximating relative memory bandwidth
+static float calculate_bandwidth_score(ggml_backend_dev_t dev) {
+    float base_score = 0.0f;
+    
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            base_score = 100.0f; // GPUs typically have higher bandwidth
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            base_score = 50.0f;
+            break;
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            base_score = 20.0f;
+            break;
+        default:
+            base_score = 10.0f;
+    }
+    
+    // Get device description
+    std::string desc = ggml_backend_dev_description(dev);
+    
+    // Adjust based on known device characteristics
+    if (desc.find("HBM") != std::string::npos) base_score *= 1.5f;  // High Bandwidth Memory
+    if (desc.find("GDDR6X") != std::string::npos) base_score *= 1.3f;
+    if (desc.find("GDDR6") != std::string::npos) base_score *= 1.2f;
+    
+    return base_score;
+}
+
+// Collect and rank devices by their capabilities
+static std::vector<device_capabilities> rank_devices(const std::vector<ggml_backend_dev_t>& devices) {
+    std::vector<device_capabilities> ranked_devices;
+    
+    for (auto* dev : devices) {
+        device_capabilities cap;
+        cap.device = dev;
+        cap.name = ggml_backend_dev_name(dev);
+        cap.description = ggml_backend_dev_description(dev);
+        ggml_backend_dev_memory(dev, &cap.free_memory, &cap.total_memory);
+        cap.compute_score = calculate_compute_score(dev);
+        cap.bandwidth_score = calculate_bandwidth_score(dev);
+        
+        ranked_devices.push_back(cap);
+    }
+    
+    // Sort devices by a combination of memory capacity and compute capability
+    std::sort(ranked_devices.begin(), ranked_devices.end(), 
+        [](const device_capabilities& a, const device_capabilities& b) {
+            // Create a composite score that prioritizes both memory and compute power
+            float a_score = a.free_memory * 1e-9f * 0.7f + a.compute_score * 0.3f;
+            float b_score = b.free_memory * 1e-9f * 0.7f + b.compute_score * 0.3f;
+            return a_score > b_score; // Higher score first
+        });
+    
+    return ranked_devices;
+}
+
 static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
@@ -163,21 +270,23 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     llama_model * model = new llama_model(params);
-
-    // create list of devices to use with this model
+    
+    std::vector<ggml_backend_dev_t> available_devices;
+    
+    // Create list of devices to use with this model
     if (params.devices) {
         for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
-            model->devices.push_back(*dev);
+            available_devices.push_back(*dev);
         }
     } else {
         std::vector<ggml_backend_dev_t> rpc_servers;
-        // use all available devices
+        // Use all available devices
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             switch (ggml_backend_dev_type(dev)) {
                 case GGML_BACKEND_DEVICE_TYPE_CPU:
                 case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-                    // skip CPU backends since they are handled separately
+                    // Skip CPU backends since they are handled separately
                     break;
 
                 case GGML_BACKEND_DEVICE_TYPE_GPU:
@@ -185,37 +294,72 @@ static struct llama_model * llama_model_load_from_file_impl(
                     if (ggml_backend_reg_name(reg) == std::string("RPC")) {
                         rpc_servers.push_back(dev);
                     } else {
-                        model->devices.push_back(dev);
+                        available_devices.push_back(dev);
                     }
                     break;
             }
         }
-        // add RPC servers at the front of the list
+        // Add RPC servers at the front of the list
         if (!rpc_servers.empty()) {
-            model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
+            available_devices.insert(available_devices.begin(), rpc_servers.begin(), rpc_servers.end());
         }
     }
 
-    // if using single GPU mode, remove all except the main GPU
+    // If using single GPU mode, remove all except the main GPU
     if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
         if (params.main_gpu < 0) {
-            model->devices.clear();
+            available_devices.clear();
         } else {
-            if (params.main_gpu >= (int)model->devices.size()) {
-                LLAMA_LOG_ERROR("%s: invalid value for main_gpu: %d (available devices: %zu)\n", __func__, params.main_gpu, model->devices.size());
+            if (params.main_gpu >= (int)available_devices.size()) {
+                LLAMA_LOG_ERROR("%s: invalid value for main_gpu: %d (available devices: %zu)\n", __func__, params.main_gpu, available_devices.size());
                 llama_model_free(model);
                 return nullptr;
             }
-            ggml_backend_dev_t main_gpu = model->devices[params.main_gpu];
-            model->devices.clear();
-            model->devices.push_back(main_gpu);
+            ggml_backend_dev_t main_gpu = available_devices[params.main_gpu];
+            available_devices.clear();
+            available_devices.push_back(main_gpu);
         }
     }
-
+    
+    // If we have multiple devices, rank and organize them by capabilities
+    if (available_devices.size() > 1 && params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+        // Rank devices by their capabilities
+        std::vector<device_capabilities> ranked_devices = rank_devices(available_devices);
+        
+        // Clear the existing devices and replace with ranked devices
+        model->devices.clear();
+        
+        // Log the ranked devices
+        LLAMA_LOG_INFO("%s: device ranking by capability:\n", __func__);
+        for (size_t i = 0; i < ranked_devices.size(); ++i) {
+            const auto& dev_cap = ranked_devices[i];
+            LLAMA_LOG_INFO("  [%zu] %s (%s) - %.2f GB free, compute score: %.1f, bandwidth score: %.1f\n",
+                          i,
+                          dev_cap.name.c_str(),
+                          dev_cap.description.c_str(),
+                          dev_cap.free_memory / (1024.0f * 1024.0f * 1024.0f),
+                          dev_cap.compute_score,
+                          dev_cap.bandwidth_score);
+            
+            model->devices.push_back(dev_cap.device);
+        }
+    } else {
+        // Just use the devices as-is
+        model->devices = available_devices;
+    }
+    
+    // Log the devices we'll be using
+    LLAMA_LOG_INFO("%s: using %zu devices for model inference:\n", __func__, model->devices.size());
     for (auto * dev : model->devices) {
         size_t free, total; // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
-        LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
+        LLAMA_LOG_INFO("%s: using device %s (%s) - %.2f/%.2f GB (%.1f%% free)\n",
+                      __func__,
+                      ggml_backend_dev_name(dev),
+                      ggml_backend_dev_description(dev),
+                      free / (1024.0f * 1024.0f * 1024.0f),
+                      total / (1024.0f * 1024.0f * 1024.0f),
+                      (float)free / (float)total * 100.0f);
     }
 
     const int status = llama_model_load(path_model, splits, *model, params);
@@ -355,4 +499,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

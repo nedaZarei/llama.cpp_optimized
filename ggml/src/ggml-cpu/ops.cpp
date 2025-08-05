@@ -108,8 +108,10 @@ static void ggml_compute_forward_dup_f16(
                         id += ne00 * ir0;
                         for (int i01 = ir0; i01 < ir1; i01++) {
                             const ggml_fp16_t * src0_ptr = (ggml_fp16_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
-                            ggml_cpu_fp16_to_fp32(src0_ptr, dst_ptr + id, ne00);
-                            id += ne00;
+                            for (int i00 = 0; i00 < ne00; i00++) {
+                                dst_ptr[id] = GGML_CPU_FP16_TO_FP32(src0_ptr[i00]);
+                                id++;
+                            }
                         }
                         id += ne00 * (ne01 - ir1);
                     }
@@ -362,7 +364,6 @@ static void ggml_compute_forward_dup_bf16(
                     }
                 }
             } else if (dst->type == GGML_TYPE_F16) {
-                float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
                 size_t id = 0;
                 ggml_fp16_t * dst_ptr = (ggml_fp16_t *) dst->data;
 
@@ -371,9 +372,10 @@ static void ggml_compute_forward_dup_bf16(
                         id += ne00 * ir0;
                         for (int i01 = ir0; i01 < ir1; i01++) {
                             const ggml_bf16_t * src0_ptr = (ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
-                            ggml_cpu_bf16_to_fp32(src0_ptr, src0_f32, ne00);
-                            ggml_cpu_fp32_to_fp16(src0_f32, dst_ptr + id, ne00);
-                            id += ne00;
+                            for (int i00 = 0; i00 < ne00; i00++) {
+                                dst_ptr[id] = GGML_CPU_FP32_TO_FP16(GGML_BF16_TO_FP32(src0_ptr[i00]));
+                                id++;
+                            }
                         }
                         id += ne00 * (ne01 - ir1);
                     }
@@ -387,8 +389,10 @@ static void ggml_compute_forward_dup_bf16(
                         id += ne00 * ir0;
                         for (int i01 = ir0; i01 < ir1; i01++) {
                             const ggml_bf16_t * src0_ptr = (ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
-                            ggml_cpu_bf16_to_fp32(src0_ptr, dst_ptr + id, ne00);
-                            id += ne00;
+                            for (int i00 = 0; i00 < ne00; i00++) {
+                                dst_ptr[id] = GGML_BF16_TO_FP32(src0_ptr[i00]);
+                                id++;
+                            }
                         }
                         id += ne00 * (ne01 - ir1);
                     }
@@ -2251,7 +2255,9 @@ static void ggml_compute_forward_repeat_f16(
                                 ggml_fp16_t * y = (ggml_fp16_t *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0);
                                 ggml_fp16_t * x = (ggml_fp16_t *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01);
                                 // ggml_vec_cpy_f16(ne00, y, x)
-                                memcpy(y, x, ne00 * sizeof(ggml_fp16_t));
+                                for (int i = 0; i < ne00; ++i) {
+                                    y[i]  = x[i];
+                                }
                             }
                         }
                     }
@@ -5223,7 +5229,7 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i11 = i02%ne11;
                 const int64_t i10 = i;
 
-                const int32_t i1 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                const int64_t i1 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 

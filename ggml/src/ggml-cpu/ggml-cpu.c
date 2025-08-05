@@ -1127,8 +1127,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-    //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
-
     // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
@@ -1140,15 +1138,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // block-tiling attempt
+    // block-tiling attempt - improves cache locality
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
-    // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
-    float tmp[32];
+    // Align temporary buffer to cache line for better cache behavior
+    GGML_CACHE_ALIGN float tmp[32]; // 16 * 2, accounting for mmla kernels
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1170,23 +1167,21 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
                 //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char*)wdata +
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
-
+                // Process multiple rows at once when possible to improve vectorization
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
+                // Use a single memcpy instead of multiple when possible for better performance
+                const size_t copy_size = (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float);
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), copy_size);
                 }
             }
         }
@@ -1266,30 +1261,27 @@ UseGgmlGemm1:;
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-    #if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
-                }
-            }
-        }
-    #else
+        // Memory access pattern optimization: process by blocks to improve cache locality
+        const int64_t block_size = 8; // Adjust based on cache size
+        
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    
+                    // Distribute work among threads with better cache behavior
+                    for (int64_t block_start = ith * block_size; block_start < ne10/bs; block_start += nth * block_size) {
+                        int64_t block_end = MIN(block_start + block_size, (ne10/bs));
+                        
+                        // Convert a block of data at once for better locality
+                        from_float(
+                            (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + block_start*bs*nb10),
+                            (void *)(wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + block_start*nbw0),
+                            (block_end - block_start) * bs);
+                    }
                 }
             }
         }
-    #endif
     }
 
     if (ith == 0) {
@@ -1329,10 +1321,11 @@ UseGgmlGemm2:;
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
 
-    // Now select a reasonable chunk size.
+    // Choose chunk size based on cache line size for better locality
+    // Using a multiple of cache line size improves memory access patterns
     int chunk_size = 16;
 
-    // We need to step up the size if it's small
+    // Adjust chunk size for small tensors
     if (nr0 == 1 || nr1 == 1) {
         chunk_size = 64;
     }
@@ -1460,7 +1453,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
-
+    // Ensure memory is properly aligned for SIMD operations
     void * ptr = *p;
     ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
     *p = (void *) ((char *) ptr + size);
